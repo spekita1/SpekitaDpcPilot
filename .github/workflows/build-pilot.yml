@@ -1,0 +1,76 @@
+name: Build QR Device Owner pilot
+
+on:
+  push:
+    branches: [master]
+    tags: ["pilot-v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android and QR tooling
+        run: |
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          sudo apt-get update
+          sudo apt-get install -y qrencode
+
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+
+      - name: Build unchanged TestDPC baseline
+        run: bazel build //:testdpc
+
+      - name: Assemble pilot assets
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          cp bazel-bin/testdpc.apk dist/SpekitaDpcPilot.apk
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            download_url="https://github.com/${REPOSITORY}/releases/download/${TAG}/SpekitaDpcPilot.apk"
+          else
+            download_url="https://invalid.example/not-a-release/SpekitaDpcPilot.apk"
+          fi
+          bash scripts/generate-provisioning-assets.sh dist/SpekitaDpcPilot.apk "$download_url" dist
+          sha256sum dist/SpekitaDpcPilot.apk > dist/SHA256SUMS.txt
+
+      - name: Upload verification artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpekitaDpcPilot-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish pilot release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "Spekita DPC Pilot ${GITHUB_REF_NAME}" \
+            --notes "Unmodified official TestDPC control build for factory-reset QR Device Owner provisioning. Not for production."
