@@ -77,7 +77,7 @@ jobs:
         run: |
           set -euo pipefail
           download_url="https://github.com/${REPOSITORY}/releases/download/${RELEASE_TAG}/SpekitaDpcPilot.apk"
-          scripts/generate-provisioning-assets.sh \
+          bash scripts/generate-provisioning-assets.sh \
             dist/SpekitaDpcPilot.apk \
             "$download_url" \
             dist \
