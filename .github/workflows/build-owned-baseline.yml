@@ -1,0 +1,202 @@
+name: Build custom-signed upstream baseline
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type BUILD_CUSTOM_SIGNED_UPSTREAM_BASELINE"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_APK_URL: https://github.com/googlesamples/android-testdpc/releases/download/v9.0.12/TestDPC_9.0.12.apk
+  UPSTREAM_APK_SHA256: aad38c1f608b1c7289405c4e866977f5d231502643ce2e2401a7c305808f9c00
+  UPSTREAM_SIGNATURE_CHECKSUM: gJD2YwtOiWJHkSMkkIfLRlj-quNqG1fb6v100QmzM9w=
+  UPSTREAM_SOURCE_COMMIT: 7a8957beb7c2e01a1bf5776898542e24f6f288fb
+  PACKAGE_NAME: com.afwsamples.testdpc
+  ADMIN_COMPONENT: com.afwsamples.testdpc/com.afwsamples.testdpc.DeviceAdminReceiver
+  RELEASE_TAG: pilot-v0.2.0
+
+jobs:
+  build:
+    name: Re-sign verified official TestDPC APK with owned key
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.confirmation }}" != "BUILD_CUSTOM_SIGNED_UPSTREAM_BASELINE" ]]; then
+            echo "Confirmation text does not match" >&2
+            exit 1
+          fi
+
+      - name: Check out helper scripts
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install verification tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager "build-tools;35.0.0"
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y jq qrencode unzip xxd
+
+      - name: Validate signing secrets
+        shell: bash
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.DPC_KEYSTORE_BASE64 }}
+          RELEASE_KEY_ALIAS: ${{ secrets.DPC_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.DPC_KEY_PASSWORD }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.DPC_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in RELEASE_KEYSTORE_BASE64 RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD RELEASE_STORE_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing required secret: ${name}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Download and verify official APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          curl --fail --location --retry 3 --output dist/TestDPC-official.apk "$UPSTREAM_APK_URL"
+          echo "$UPSTREAM_APK_SHA256  dist/TestDPC-official.apk" | sha256sum --check --strict
+
+          aapt dump badging dist/TestDPC-official.apk | tee dist/AAPT_OFFICIAL.txt
+          package_name="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" dist/AAPT_OFFICIAL.txt | head -n1)"
+          test "$package_name" = "$PACKAGE_NAME"
+
+          apksigner verify --verbose --print-certs dist/TestDPC-official.apk | tee dist/APKSIGNER_OFFICIAL.txt
+          cert_hex="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' dist/APKSIGNER_OFFICIAL.txt | head -n1 | tr -d ':[:space:]')"
+          official_checksum="$(printf '%s' "$cert_hex" | xxd -r -p | openssl base64 -A | sed 's/+/-/g; s#/#_#g')"
+          test "$official_checksum" = "$UPSTREAM_SIGNATURE_CHECKSUM"
+
+      - name: Re-sign APK without modifying application contents
+        shell: bash
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.DPC_KEYSTORE_BASE64 }}
+          RELEASE_KEY_ALIAS: ${{ secrets.DPC_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.DPC_KEY_PASSWORD }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.DPC_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > dist/release.keystore
+          zipalign -f 4 dist/TestDPC-official.apk dist/TestDPC-aligned.apk
+          apksigner sign \
+            --ks dist/release.keystore \
+            --ks-key-alias "$RELEASE_KEY_ALIAS" \
+            --ks-pass "pass:$RELEASE_STORE_PASSWORD" \
+            --key-pass "pass:$RELEASE_KEY_PASSWORD" \
+            --out dist/SpekitaDpcPilot.apk \
+            dist/TestDPC-aligned.apk
+
+          apksigner verify --verbose --print-certs dist/SpekitaDpcPilot.apk | tee dist/APKSIGNER_CUSTOM.txt
+          if grep -q '^Signer #2' dist/APKSIGNER_CUSTOM.txt; then
+            echo "Unexpected second signer" >&2
+            exit 1
+          fi
+          aapt dump badging dist/SpekitaDpcPilot.apk | tee dist/AAPT_CUSTOM.txt
+          package_name="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" dist/AAPT_CUSTOM.txt | head -n1)"
+          test "$package_name" = "$PACKAGE_NAME"
+
+          cert_hex="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' dist/APKSIGNER_CUSTOM.txt | head -n1 | tr -d ':[:space:]')"
+          custom_checksum="$(printf '%s' "$cert_hex" | xxd -r -p | openssl base64 -A | sed 's/+/-/g; s#/#_#g')"
+          test "$custom_checksum" != "$UPSTREAM_SIGNATURE_CHECKSUM"
+          printf '%s\n' "$custom_checksum" > dist/CUSTOM_SIGNATURE_CHECKSUM.txt
+
+          mkdir -p dist/payload-official dist/payload-custom
+          unzip -qq dist/TestDPC-official.apk -d dist/payload-official
+          unzip -qq dist/SpekitaDpcPilot.apk -d dist/payload-custom
+          (
+            cd dist/payload-official
+            find . -type f ! -path './META-INF/*' -print0 \
+              | sort -z \
+              | xargs -0 sha256sum
+          ) > dist/PAYLOAD_OFFICIAL_SHA256.txt
+          (
+            cd dist/payload-custom
+            find . -type f ! -path './META-INF/*' -print0 \
+              | sort -z \
+              | xargs -0 sha256sum
+          ) > dist/PAYLOAD_CUSTOM_SHA256.txt
+          diff -u dist/PAYLOAD_OFFICIAL_SHA256.txt dist/PAYLOAD_CUSTOM_SHA256.txt
+          rm -rf dist/payload-official dist/payload-custom
+
+      - name: Generate provisioning assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          custom_checksum="$(cat dist/CUSTOM_SIGNATURE_CHECKSUM.txt)"
+          download_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/SpekitaDpcPilot.apk"
+          scripts/generate-owned-baseline-assets.sh \
+            dist/SpekitaDpcPilot.apk \
+            "$download_url" \
+            dist \
+            "$custom_checksum" \
+            "$UPSTREAM_SOURCE_COMMIT" \
+            "$UPSTREAM_APK_SHA256" \
+            "$UPSTREAM_SIGNATURE_CHECKSUM"
+          printf '%s\n' "$UPSTREAM_APK_SHA256" > dist/OFFICIAL_APK_SHA256.txt
+          printf '%s\n' "$UPSTREAM_SOURCE_COMMIT" > dist/UPSTREAM_COMMIT.txt
+          rm -f dist/TestDPC-official.apk dist/TestDPC-aligned.apk dist/release.keystore
+          (cd dist && sha256sum SpekitaDpcPilot.apk provisioning.json provisioning-metadata.json provisioning-qr.png > SHA256SUMS.txt)
+
+      - name: Upload verification artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: custom-signed-upstream-baseline
+          path: dist/
+          if-no-files-found: error
+
+      - name: Refuse to overwrite an existing release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to overwrite it" >&2
+            exit 1
+          fi
+
+      - name: Publish diagnostic pilot release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            dist/SpekitaDpcPilot.apk \
+            dist/provisioning.json \
+            dist/provisioning-metadata.json \
+            dist/provisioning-qr.png \
+            dist/CUSTOM_SIGNATURE_CHECKSUM.txt \
+            dist/OFFICIAL_APK_SHA256.txt \
+            dist/UPSTREAM_COMMIT.txt \
+            dist/APKSIGNER_OFFICIAL.txt \
+            dist/APKSIGNER_CUSTOM.txt \
+            dist/AAPT_OFFICIAL.txt \
+            dist/AAPT_CUSTOM.txt \
+            dist/PAYLOAD_OFFICIAL_SHA256.txt \
+            dist/PAYLOAD_CUSTOM_SHA256.txt \
+            dist/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$RELEASE_TAG custom-signed upstream baseline" \
+            --notes "Diagnostic pilot only. The fixed, verified official TestDPC v9.0.12 APK is re-signed with the Spekita-owned release key without rebuilding application code. Package and Device Admin component are unchanged; APK signature and container bytes differ. Not for production."
