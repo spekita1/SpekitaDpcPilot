@@ -1,0 +1,202 @@
+name: Build owned TestDPC baseline
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type BUILD_OWNED_DPC_BASELINE to continue
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPOSITORY: googlesamples/android-testdpc
+  UPSTREAM_TAG: v9.0.12
+  UPSTREAM_COMMIT: 7a8957beb7c2e01a1bf5776898542e24f6f288fb
+  RELEASE_TAG: pilot-v0.2.0-owned
+
+jobs:
+  build:
+    name: Build exact TestDPC source with owned signing key
+    runs-on: ubuntu-latest
+    env:
+      DPC_KEYSTORE_BASE64: ${{ secrets.DPC_KEYSTORE_BASE64 }}
+      DPC_KEYSTORE_PASSWORD: ${{ secrets.DPC_KEYSTORE_PASSWORD }}
+      DPC_KEY_ALIAS: ${{ secrets.DPC_KEY_ALIAS }}
+      DPC_KEY_PASSWORD: ${{ secrets.DPC_KEY_PASSWORD }}
+    steps:
+      - name: Validate confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.confirmation }}" != "BUILD_OWNED_DPC_BASELINE" ]]; then
+            echo "Confirmation text does not match."
+            exit 1
+          fi
+
+      - name: Check out pilot helpers
+        uses: actions/checkout@v4
+
+      - name: Check out exact upstream TestDPC source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ env.UPSTREAM_COMMIT }}
+          path: upstream-src
+
+      - name: Verify upstream source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_commit="$(git -C upstream-src rev-parse HEAD)"
+          if [[ "$actual_commit" != "$UPSTREAM_COMMIT" ]]; then
+            echo "Unexpected upstream commit: $actual_commit"
+            exit 1
+          fi
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@0.15.0
+
+      - name: Install build tools and provisioning utilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager "build-tools;35.0.0"
+          sudo apt-get update
+          sudo apt-get install -y jq qrencode xxd
+
+      - name: Validate signing secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in DPC_KEYSTORE_BASE64 DPC_KEYSTORE_PASSWORD DPC_KEY_ALIAS DPC_KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Required GitHub Actions secret is missing: $name"
+              exit 1
+            fi
+          done
+
+      - name: Decode owned signing key
+        id: signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          keystore="$RUNNER_TEMP/dpc-release.jks"
+          printf '%s' "$DPC_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          chmod 600 "$keystore"
+          echo "keystore=$keystore" >> "$GITHUB_OUTPUT"
+
+      - name: Build unchanged TestDPC baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd upstream-src
+          bazel build //:testdpc
+
+      - name: Align, sign, and verify APK
+        shell: bash
+        env:
+          KEYSTORE_PATH: ${{ steps.signing.outputs.keystore }}
+        run: |
+          set -euo pipefail
+          build_tools="$ANDROID_HOME/build-tools/35.0.0"
+          mkdir -p dist
+          "$build_tools/zipalign" -f 4 upstream-src/bazel-bin/testdpc.apk dist/aligned.apk
+          "$build_tools/apksigner" sign \
+            --ks "$KEYSTORE_PATH" \
+            --ks-key-alias "$DPC_KEY_ALIAS" \
+            --ks-pass env:DPC_KEYSTORE_PASSWORD \
+            --key-pass env:DPC_KEY_PASSWORD \
+            --out dist/SpekitaOwnedDpc.apk \
+            dist/aligned.apk
+          "$build_tools/apksigner" verify --verbose --print-certs \
+            dist/SpekitaOwnedDpc.apk | tee dist/APKSIGNER.txt
+
+          package_name="$("$build_tools/aapt" dump badging dist/SpekitaOwnedDpc.apk \
+            | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n1)"
+          if [[ "$package_name" != "com.afwsamples.testdpc" ]]; then
+            echo "Unexpected package name: $package_name"
+            exit 1
+          fi
+
+      - name: Generate QR and verification metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          cert_hex="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' \
+            dist/APKSIGNER.txt | head -n1 | tr -d ':[:space:]')"
+          if [[ ! "$cert_hex" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "Could not derive the signing certificate digest."
+            exit 1
+          fi
+          signature_checksum="$(printf '%s' "$cert_hex" \
+            | xxd -r -p | openssl base64 -A | tr '+/' '-_')"
+          download_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/SpekitaOwnedDpc.apk"
+          bash scripts/generate-owned-baseline-assets.sh \
+            dist/SpekitaOwnedDpc.apk \
+            "$download_url" \
+            dist \
+            "$signature_checksum" \
+            "$UPSTREAM_COMMIT"
+          printf '%s\n' "$UPSTREAM_COMMIT" > dist/SOURCE_COMMIT.txt
+          rm -f dist/aligned.apk
+          (
+            cd dist
+            sha256sum SpekitaOwnedDpc.apk provisioning.json \
+              provisioning-qr.png provisioning-metadata.json \
+              APKSIGNER.txt SOURCE_COMMIT.txt > SHA256SUMS.txt
+          )
+
+      - name: Upload verification artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: owned-testdpc-baseline
+          path: |
+            dist/SpekitaOwnedDpc.apk
+            dist/provisioning.json
+            dist/provisioning-qr.png
+            dist/provisioning-metadata.json
+            dist/SHA256SUMS.txt
+            dist/APKSIGNER.txt
+            dist/SOURCE_COMMIT.txt
+          if-no-files-found: error
+
+      - name: Refuse to overwrite an existing release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to overwrite it."
+            exit 1
+          fi
+
+      - name: Publish owned baseline pilot release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            dist/SpekitaOwnedDpc.apk \
+            dist/provisioning.json \
+            dist/provisioning-qr.png \
+            dist/provisioning-metadata.json \
+            dist/SHA256SUMS.txt \
+            dist/APKSIGNER.txt \
+            dist/SOURCE_COMMIT.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$RELEASE_TAG" \
+            --notes "Exact TestDPC $UPSTREAM_TAG source ($UPSTREAM_COMMIT), signed with the project-owned pilot key. Diagnostic baseline only; not for production."
